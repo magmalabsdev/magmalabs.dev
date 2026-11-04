@@ -181,6 +181,58 @@
     return path ? path : null;
   }
 
+  const VIDEO_EXT = /\.(mp4|webm|mov|m4v|ogv)$/i;
+
+  function isVideoSrc(src) {
+    try {
+      return VIDEO_EXT.test(new URL(src, window.location.href).pathname);
+    } catch {
+      return VIDEO_EXT.test(String(src || "").split(/[?#]/)[0]);
+    }
+  }
+
+  // Accepts a path/URL string or { src, type, poster }; returns { src, type, poster } or null.
+  function normalizeMedia(value) {
+    const raw = value && typeof value === "object" ? value : { src: value };
+    const src = normalizeImagePath(raw.src);
+    if (!src) return null;
+    const type = raw.type === "video" || raw.type === "image" ? raw.type : isVideoSrc(src) ? "video" : "image";
+    return { src, type, poster: type === "video" ? normalizeImagePath(raw.poster) : null };
+  }
+
+  function createMedia(media, { className = "", alt = "", eager = false, controls = false, width, height } = {}) {
+    if (media.type === "video") {
+      const video = document.createElement("video");
+      video.className = className;
+      video.src = media.src;
+      if (media.poster) video.poster = media.poster;
+      video.muted = true;
+      video.loop = !controls;
+      video.playsInline = true;
+      video.preload = "metadata";
+      if (controls) {
+        video.controls = true;
+        video.setAttribute("aria-label", alt);
+      } else {
+        const reduceMotion =
+          window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+        video.autoplay = !reduceMotion;
+        video.setAttribute("aria-hidden", "true");
+        video.tabIndex = -1;
+      }
+      return video;
+    }
+    const img = document.createElement("img");
+    img.className = className;
+    img.src = media.src;
+    img.alt = alt;
+    img.loading = eager ? "eager" : "lazy";
+    img.decoding = "async";
+    if (width) img.width = width;
+    if (height) img.height = height;
+    return img;
+  }
+
   function normalizeUrl(value) {
     const url = String(value || "").trim();
     return url ? url : null;
@@ -285,14 +337,20 @@
       raw?.images && typeof raw.images === "object" ? raw.images : null;
 
     const icon = normalizeImagePath(imagesRaw?.icon ?? raw?.icon);
-    const thumbnail = normalizeImagePath(imagesRaw?.thumbnail ?? raw?.thumbnail);
+    const thumbnailMedia = normalizeMedia(imagesRaw?.thumbnail ?? raw?.thumbnail);
 
     const galleryRaw = imagesRaw?.gallery ?? raw?.gallery;
-    const gallery = Array.isArray(galleryRaw)
-      ? galleryRaw.map(normalizeImagePath).filter(Boolean)
+    const galleryMedia = Array.isArray(galleryRaw)
+      ? galleryRaw.map(normalizeMedia).filter(Boolean)
       : [];
 
-    return { icon, thumbnail, gallery };
+    // `thumbnail` / `gallery` stay plain image URLs for consumers that can't show video
+    // (a video falls back to its poster, if any).
+    const toImage = (m) => (m.type === "video" ? m.poster : m.src);
+    const thumbnail = thumbnailMedia ? toImage(thumbnailMedia) || null : null;
+    const gallery = galleryMedia.map(toImage).filter(Boolean);
+
+    return { icon, thumbnail, gallery, thumbnailMedia, galleryMedia };
   }
 
   function normalizeProduct(raw) {
@@ -315,9 +373,12 @@
     const releasedDate = parseISODate(raw?.releasedAt);
     const updatedDate = parseISODate(raw?.updatedAt);
     const images = normalizeProductImages(raw);
-    const repoUrl = normalizeUrl(raw?.repoUrl || raw?.repo || raw?.repository || raw?.sourceUrl);
-    const demoUrl = normalizeUrl(raw?.demoUrl || raw?.demo || raw?.liveUrl);
-    const docsUrl = normalizeUrl(raw?.docsUrl || raw?.documentation || raw?.docs || raw?.documentationUrl);
+    const links = (Array.isArray(raw?.links) ? raw.links : [])
+      .map((link) => ({
+        label: String(link?.label || "").trim(),
+        url: normalizeUrl(link?.url)
+      }))
+      .filter((link) => link.label && link.url);
 
     return {
       id,
@@ -327,13 +388,11 @@
       features,
       tags,
       tagsNormalized,
-      isFeatured: Boolean(raw?.isFeatured),
+      isFeatured: false,
       releasedDate,
       updatedDate,
       images,
-      repoUrl,
-      demoUrl,
-      docsUrl
+      links
     };
   }
 
@@ -346,7 +405,12 @@
     const data = await response.json();
     const products = Array.isArray(data?.products) ? data.products : [];
 
+    const featuredIds = Array.isArray(data?.featured) ? data.featured.map(String) : [];
     const normalized = products.filter(isVisibleEntry).map(normalizeProduct).filter(Boolean);
+    normalized.forEach((p) => {
+      p.featuredOrder = featuredIds.indexOf(p.id);
+      p.isFeatured = p.featuredOrder !== -1;
+    });
 
     const now = new Date();
     normalized.sort((a, b) => {
@@ -398,20 +462,17 @@
   }
 
   function createProductThumbnail(product) {
-    if (!product.images?.thumbnail) return null;
+    if (!product.images?.thumbnailMedia) return null;
 
     const wrap = document.createElement("div");
     wrap.className = "product-thumb";
     wrap.setAttribute("aria-hidden", "true");
 
-    const img = document.createElement("img");
-    img.className = "product-thumb-img";
-    img.src = product.images.thumbnail;
-    img.alt = "";
-    img.loading = "lazy";
-    img.decoding = "async";
-    img.width = 1200;
-    img.height = 675;
+    const img = createMedia(product.images.thumbnailMedia, {
+      className: "product-thumb-img",
+      width: 1200,
+      height: 675
+    });
     img.addEventListener("error", () => {
       wrap.remove();
     });
@@ -421,25 +482,28 @@
   }
 
   function createProductGallery(product) {
-    const gallery = product.images?.gallery || [];
+    const gallery = product.images?.galleryMedia || [];
     if (!gallery.length) return null;
 
     const wrap = document.createElement("div");
     wrap.className = "product-gallery";
     wrap.setAttribute("aria-label", `${product.name} gallery`);
 
-    gallery.forEach((src, index) => {
-      const link = document.createElement("a");
+    gallery.forEach((media, index) => {
+      const isVideo = media.type === "video";
+      // Videos get native controls, so they can't sit inside a navigating link.
+      const link = document.createElement(isVideo ? "div" : "a");
       link.className = "product-gallery-item";
-      link.href = src;
-      link.target = "_blank";
-      link.rel = "noopener";
+      if (!isVideo) {
+        link.href = media.src;
+        link.target = "_blank";
+        link.rel = "noopener";
+      }
 
-      const img = document.createElement("img");
-      img.src = src;
-      img.alt = `${product.name} gallery image ${index + 1}`;
-      img.loading = "lazy";
-      img.decoding = "async";
+      const img = createMedia(media, {
+        alt: `${product.name} gallery ${isVideo ? "video" : "image"} ${index + 1}`,
+        controls: isVideo
+      });
       img.addEventListener("error", () => {
         link.remove();
         if (!wrap.childNodes.length) wrap.remove();
@@ -511,20 +575,13 @@
       hasLink = true;
     }
 
-    const resources = [
-      { url: product.repoUrl, text: "Repository" },
-      { url: product.demoUrl, text: "Demo" },
-      { url: product.docsUrl, text: "Documentation" }
-    ];
-
-    resources.forEach((resource) => {
-      if (!resource.url) return;
+    product.links.forEach((resource) => {
       const button = document.createElement("a");
       button.className = "btn small secondary";
       button.href = resource.url;
       button.target = "_blank";
       button.rel = "noopener";
-      button.textContent = resource.text;
+      button.textContent = resource.label;
       links.appendChild(button);
       hasLink = true;
     });
@@ -538,7 +595,7 @@
     media.href = href;
     media.setAttribute("aria-label", `View ${product.name}`);
 
-    if (!product.images?.thumbnail) {
+    if (!product.images?.thumbnailMedia) {
       const fallback = document.createElement("div");
       fallback.className = "project-banner-fallback";
       fallback.textContent = product.name;
@@ -546,14 +603,11 @@
       return media;
     }
 
-    const img = document.createElement("img");
-    img.className = "project-banner-img";
-    img.src = product.images.thumbnail;
-    img.alt = "";
-    img.loading = "lazy";
-    img.decoding = "async";
-    img.width = 1200;
-    img.height = 675;
+    const img = createMedia(product.images.thumbnailMedia, {
+      className: "project-banner-img",
+      width: 1200,
+      height: 675
+    });
     img.addEventListener("error", () => {
       media.textContent = "";
       const fallback = document.createElement("div");
@@ -792,13 +846,11 @@
     media.className = "hero-slide-media";
     media.href = href;
     media.setAttribute("aria-label", `View ${product.name}`);
-    if (product.images?.thumbnail) {
-      const img = document.createElement("img");
-      img.className = "hero-slide-img";
-      img.src = product.images.thumbnail;
-      img.alt = "";
-      img.loading = "eager";
-      img.decoding = "async";
+    if (product.images?.thumbnailMedia) {
+      const img = createMedia(product.images.thumbnailMedia, {
+        className: "hero-slide-img",
+        eager: true
+      });
       img.addEventListener("error", () => {
         media.classList.add("is-empty");
         media.textContent = product.name;
@@ -831,12 +883,13 @@
     actions.className = "hero-slide-actions";
     const primary = document.createElement("a");
     primary.className = "btn primary";
-    primary.href = product.demoUrl || href;
-    if (product.demoUrl) {
+    const firstLink = product.links[0];
+    primary.href = firstLink ? firstLink.url : href;
+    if (firstLink) {
       primary.target = "_blank";
       primary.rel = "noopener";
     }
-    primary.textContent = product.demoUrl ? "Open" : "Learn more";
+    primary.textContent = firstLink ? firstLink.label : "Learn more";
     actions.appendChild(primary);
 
     const secondary = document.createElement("a");
@@ -846,8 +899,8 @@
     actions.appendChild(secondary);
     body.appendChild(actions);
 
-    slide.appendChild(body);
     slide.appendChild(media);
+    slide.appendChild(body);
     return slide;
   }
 
@@ -856,7 +909,7 @@
     homeHeroRoot.textContent = "";
 
     const list = Array.isArray(products) ? products : [];
-    let featured = list.filter((p) => p.isFeatured);
+    let featured = list.filter((p) => p.isFeatured).sort((a, b) => a.featuredOrder - b.featuredOrder);
     if (!featured.length) featured = list.slice(0, 3);
     if (!featured.length) return;
 
@@ -2886,6 +2939,9 @@
     const citations = Array.isArray(raw?.citations)
       ? raw.citations.map((item) => item)
       : [];
+    const alsoSee = Array.isArray(raw?.alsoSee)
+      ? raw.alsoSee.map((id) => String(id || "").trim()).filter(Boolean)
+      : [];
 
     const minutesRaw = raw?.readMinutes;
     const readMinutes = Number.isFinite(Number(minutesRaw))
@@ -2903,6 +2959,7 @@
       updatedDate,
       images,
       citations,
+      alsoSee,
       readMinutes
     };
   }
@@ -4200,6 +4257,112 @@
     return footer;
   }
 
+  function createBlogNextDate(post) {
+    const date = post.writtenDate || post.updatedDate;
+    if (!date) return null;
+
+    const time = document.createElement("time");
+    time.dateTime = formatDateAttr(date);
+    time.textContent = formatDate(date);
+    return time;
+  }
+
+  function createBlogAlsoSeeCard(post) {
+    const card = document.createElement("a");
+    card.className = "post-also-see-card";
+    card.href = getBlogPostHref(post);
+
+    const body = document.createElement("div");
+    body.className = "post-also-see-body";
+
+    const title = document.createElement("h3");
+    title.textContent = post.title;
+    body.appendChild(title);
+
+    if (post.summary) {
+      const summary = document.createElement("p");
+      summary.className = "post-next-summary";
+      summary.textContent = post.summary;
+      body.appendChild(summary);
+    }
+
+    const meta = document.createElement("div");
+    meta.className = "post-meta";
+    const date = createBlogNextDate(post);
+    if (date) meta.appendChild(date);
+    if (post.readMinutes) {
+      const minutes = document.createElement("span");
+      minutes.textContent = `${post.readMinutes} min read`;
+      meta.appendChild(minutes);
+    }
+    if (meta.childNodes.length) body.appendChild(meta);
+
+    card.appendChild(body);
+
+    const thumbnail = createBlogThumbnail(post);
+    if (thumbnail) card.appendChild(thumbnail);
+    return card;
+  }
+
+  // Posts picked by hand in blog.json. Hidden or unknown ids are skipped, so a post
+  // can be unpublished without having to clean up every list that mentions it.
+  function createBlogAlsoSee(post, posts) {
+    const picks = post.alsoSee
+      .filter((id) => id !== post.id)
+      .map((id) => posts.find((candidate) => candidate.id === id))
+      .filter(Boolean);
+    if (!picks.length) return null;
+
+    const section = document.createElement("section");
+    section.className = "post-also-see";
+    section.appendChild(createBlogCardHeading("Also see"));
+    picks.forEach((pick) => section.appendChild(createBlogAlsoSeeCard(pick)));
+    return section;
+  }
+
+  function createBlogReadMoreCard(post) {
+    const card = document.createElement("a");
+    card.className = "post-read-more-card";
+    card.href = getBlogPostHref(post);
+
+    const thumbnail = createBlogThumbnail(post);
+    if (thumbnail) card.appendChild(thumbnail);
+
+    const title = document.createElement("h3");
+    title.textContent = post.title;
+    card.appendChild(title);
+
+    if (post.summary) {
+      const summary = document.createElement("p");
+      summary.className = "post-next-summary";
+      summary.textContent = post.summary;
+      card.appendChild(summary);
+    }
+
+    const date = createBlogNextDate(post);
+    if (date) card.appendChild(date);
+    return card;
+  }
+
+  function createBlogReadMore(post, posts) {
+    const recent = posts.filter((candidate) => candidate.id !== post.id).slice(0, 4);
+    if (!recent.length) return null;
+
+    const section = document.createElement("section");
+    section.className = "post-read-more";
+
+    const heading = document.createElement("h2");
+    heading.className = "post-read-more-heading";
+    heading.textContent = "Read more";
+    section.appendChild(heading);
+
+    const grid = document.createElement("div");
+    grid.className = "post-read-more-grid";
+    recent.forEach((item) => grid.appendChild(createBlogReadMoreCard(item)));
+    section.appendChild(grid);
+    return section;
+  }
+
   function createHomeBlogPostCard(post) {
     const href = getBlogPostHref(post);
 
@@ -4543,7 +4706,7 @@
     return "";
   }
 
-  function renderBlogPostPage(container, post) {
+  function renderBlogPostPage(container, post, posts) {
     if (!container) return;
     container.textContent = "";
 
@@ -4575,7 +4738,14 @@
     const footer = createBlogFooter(post);
     if (footer) article.appendChild(footer);
 
+    const alsoSee = createBlogAlsoSee(post, posts);
+    if (alsoSee) article.appendChild(alsoSee);
+
     container.appendChild(article);
+
+    // Outside the article so the row can run wider than the reading column.
+    const readMore = createBlogReadMore(post, posts);
+    if (readMore) container.appendChild(readMore);
   }
 
   let blogBuilderIdCounter = 0;
@@ -4825,6 +4995,7 @@
       summary: "",
       thumbnail: "",
       tags: "",
+      alsoSee: "",
       writtenAt: formatDateAttr(new Date()),
       updatedAt: "",
       readMinutes: "",
@@ -4963,6 +5134,7 @@
       summary: normalized.summary,
       thumbnail: cleanText(normalized.images?.thumbnail),
       tags: normalized.tags.join(", "),
+      alsoSee: normalized.alsoSee.join(", "),
       writtenAt: formatDateAttr(normalized.writtenDate),
       updatedAt: formatDateAttr(normalized.updatedDate),
       readMinutes: normalized.readMinutes ? String(normalized.readMinutes) : "",
@@ -5773,6 +5945,12 @@
       .map((tag) => cleanText(tag))
       .filter(Boolean);
     if (tags.length) post.tags = tags;
+
+    const alsoSee = String(postState.alsoSee || "")
+      .split(/[,\n]/)
+      .map((id) => cleanText(id))
+      .filter(Boolean);
+    if (alsoSee.length) post.alsoSee = alsoSee;
 
     const writtenAt = cleanText(postState.writtenAt);
     if (writtenAt) post.writtenAt = writtenAt;
@@ -6585,6 +6763,11 @@
                   <input class="input" type="text" data-builder-tags placeholder="robots, hackathons, websites" />
                   <span class="fineprint">Separate with commas.</span>
                 </label>
+                <label class="blog-builder-field">
+                  <span class="blog-builder-field-label">Also see</span>
+                  <input class="input" type="text" data-builder-also-see placeholder="quit-comp-math, naming-games" />
+                  <span class="fineprint">Post IDs to link at the end of this post, in order. Separate with commas.</span>
+                </label>
               </div>
 
               <div class="form-row">
@@ -6646,6 +6829,7 @@
       summary: root.querySelector("[data-builder-summary]"),
       thumbnail: root.querySelector("[data-builder-thumbnail]"),
       tags: root.querySelector("[data-builder-tags]"),
+      alsoSee: root.querySelector("[data-builder-also-see]"),
       writtenAt: root.querySelector("[data-builder-written-at]"),
       updatedAt: root.querySelector("[data-builder-updated-at]"),
       readMinutes: root.querySelector("[data-builder-read-minutes]"),
@@ -6685,6 +6869,7 @@
       refs.summary.value = state.post.summary;
       refs.thumbnail.value = state.post.thumbnail;
       refs.tags.value = state.post.tags;
+      refs.alsoSee.value = state.post.alsoSee || "";
       refs.writtenAt.value = state.post.writtenAt;
       refs.updatedAt.value = state.post.updatedAt;
       refs.readMinutes.value = state.post.readMinutes;
@@ -8333,6 +8518,10 @@
       state.post.tags = refs.tags.value;
       updateDerived();
     });
+    refs.alsoSee.addEventListener("input", () => {
+      state.post.alsoSee = refs.alsoSee.value;
+      updateDerived();
+    });
     refs.writtenAt.addEventListener("input", () => {
       state.post.writtenAt = refs.writtenAt.value;
       updateDerived();
@@ -8475,7 +8664,7 @@
           return;
         }
 
-        renderBlogPostPage(blogPostRoot, post);
+        renderBlogPostPage(blogPostRoot, post, posts);
       })
       .catch(() => {
         const message =
@@ -8821,7 +9010,7 @@
       try {
         const products = await getProducts();
         panel.textContent = "";
-        const featured = products.filter((p) => p.isFeatured);
+        const featured = products.filter((p) => p.isFeatured).sort((a, b) => a.featuredOrder - b.featuredOrder);
         const recent = products.filter((p) => !p.isFeatured).slice(0, 4);
 
         if (featured.length) {
