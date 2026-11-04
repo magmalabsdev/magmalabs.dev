@@ -6656,6 +6656,145 @@
     return Array.isArray(data?.posts) ? data.posts : [];
   }
 
+  // Dropdown for comma-separated inputs. It completes the value under the caret and
+  // writes back through a normal input event, so the field's own listener still owns
+  // the state. getOptions returns { value, label, hint } and is read on every render
+  // because the posts arrive asynchronously and the draft keeps changing.
+  function attachBlogBuilderAutocomplete(input, listId, getOptions) {
+    const wrap = document.createElement("div");
+    wrap.className = "bb-autocomplete";
+    input.parentNode.insertBefore(wrap, input);
+    wrap.appendChild(input);
+
+    const list = document.createElement("ul");
+    list.className = "bb-autocomplete-list";
+    list.id = listId;
+    list.setAttribute("role", "listbox");
+    list.hidden = true;
+    wrap.appendChild(list);
+
+    input.autocomplete = "off";
+    input.setAttribute("role", "combobox");
+    input.setAttribute("aria-autocomplete", "list");
+    input.setAttribute("aria-controls", listId);
+    input.setAttribute("aria-expanded", "false");
+
+    let matches = [];
+    let activeIndex = -1;
+
+    function getTokenRange() {
+      const caret = input.selectionStart ?? input.value.length;
+      const end = input.value.indexOf(",", caret);
+      return {
+        start: input.value.lastIndexOf(",", caret - 1) + 1,
+        end: end === -1 ? input.value.length : end
+      };
+    }
+
+    function setActive(index) {
+      activeIndex = index;
+      Array.from(list.children).forEach((item, i) => {
+        item.classList.toggle("is-active", i === index);
+        item.setAttribute("aria-selected", i === index ? "true" : "false");
+      });
+      if (index === -1) {
+        input.removeAttribute("aria-activedescendant");
+        return;
+      }
+      input.setAttribute("aria-activedescendant", list.children[index].id);
+      list.children[index].scrollIntoView({ block: "nearest" });
+    }
+
+    function close() {
+      list.hidden = true;
+      input.setAttribute("aria-expanded", "false");
+      setActive(-1);
+    }
+
+    function render() {
+      const { start, end } = getTokenRange();
+      const query = input.value.slice(start, end).trim().toLowerCase();
+      const others = (input.value.slice(0, start) + input.value.slice(end))
+        .split(",")
+        .map((token) => token.trim().toLowerCase());
+
+      const available = getOptions().filter((option) => {
+        const value = option.value.toLowerCase();
+        if (others.includes(value)) return false;
+        return value.includes(query) || option.label.toLowerCase().includes(query);
+      });
+      // Prefix matches first; the sort is stable, so getOptions' order breaks ties.
+      const startsWithQuery = (option) => option.value.toLowerCase().startsWith(query);
+      matches = available.sort((a, b) => startsWithQuery(b) - startsWithQuery(a));
+
+      list.textContent = "";
+      activeIndex = -1;
+      input.removeAttribute("aria-activedescendant");
+      matches.forEach((option, index) => {
+        const item = document.createElement("li");
+        item.id = `${listId}-${index}`;
+        item.className = "bb-autocomplete-option";
+        item.setAttribute("role", "option");
+        item.setAttribute("aria-selected", "false");
+
+        const label = document.createElement("span");
+        label.textContent = option.label;
+        item.appendChild(label);
+
+        if (option.hint) {
+          const hint = document.createElement("span");
+          hint.className = "bb-autocomplete-hint";
+          hint.textContent = option.hint;
+          item.appendChild(hint);
+        }
+        list.appendChild(item);
+      });
+
+      list.hidden = !matches.length;
+      input.setAttribute("aria-expanded", matches.length ? "true" : "false");
+    }
+
+    function choose(option) {
+      const { start, end } = getTokenRange();
+      const before = input.value.slice(0, start).trimEnd();
+      const after = input.value.slice(end).replace(/^,\s*/, "");
+      const head = `${before}${before ? " " : ""}${option.value}, `;
+      input.value = head + after;
+      input.setSelectionRange(head.length, head.length);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+
+    input.addEventListener("input", render);
+    input.addEventListener("focus", render);
+    input.addEventListener("click", render);
+    input.addEventListener("blur", close);
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        if (list.hidden) render();
+        if (!matches.length) return;
+        event.preventDefault();
+        const step = event.key === "ArrowDown" ? 1 : -1;
+        // -1 is "nothing highlighted", so stepping up from it lands on the last option.
+        const from = activeIndex === -1 && step === -1 ? 0 : activeIndex;
+        setActive((from + step + matches.length) % matches.length);
+      } else if (event.key === "Enter" && !list.hidden && activeIndex !== -1) {
+        event.preventDefault();
+        choose(matches[activeIndex]);
+      } else if (event.key === "Escape" && !list.hidden) {
+        event.preventDefault();
+        close();
+      }
+    });
+
+    // Keep focus in the input while the list is pressed, including its scrollbar.
+    list.addEventListener("mousedown", (event) => event.preventDefault());
+    list.addEventListener("click", (event) => {
+      const item = event.target.closest("[role='option']");
+      if (!item) return;
+      choose(matches[Array.from(list.children).indexOf(item)]);
+    });
+  }
+
   function initBlogBuilder(root) {
     if (!root) return;
 
@@ -8522,6 +8661,36 @@
       state.post.alsoSee = refs.alsoSee.value;
       updateDerived();
     });
+    attachBlogBuilderAutocomplete(refs.tags, "bb-tags-options", () => {
+      const counts = new Map();
+      (state.availablePosts || []).forEach((post) => {
+        (Array.isArray(post.tags) ? post.tags : []).forEach((rawTag) => {
+          const tag = cleanText(rawTag);
+          if (!tag) return;
+          const key = tag.toLowerCase();
+          const entry = counts.get(key) || { value: tag, count: 0 };
+          entry.count += 1;
+          counts.set(key, entry);
+        });
+      });
+      return Array.from(counts.values())
+        .sort((a, b) => a.value.localeCompare(b.value))
+        .map(({ value, count }) => ({
+          value,
+          label: value,
+          hint: `${count} post${count === 1 ? "" : "s"}`
+        }));
+    });
+    attachBlogBuilderAutocomplete(refs.alsoSee, "bb-also-see-options", () =>
+      (state.availablePosts || [])
+        .filter((post) => cleanText(post.id) !== cleanText(state.post.id))
+        .map((post) => ({
+          value: cleanText(post.id),
+          label: cleanText(post.title),
+          hint: isVisibleEntry(post) ? cleanText(post.id) : `${cleanText(post.id)} (hidden)`
+        }))
+        .sort((a, b) => a.label.localeCompare(b.label))
+    );
     refs.writtenAt.addEventListener("input", () => {
       state.post.writtenAt = refs.writtenAt.value;
       updateDerived();
