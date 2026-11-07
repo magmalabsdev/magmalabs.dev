@@ -178,7 +178,10 @@
 
   function normalizeImagePath(value) {
     const path = String(value || "").trim();
-    return path ? path : null;
+    if (!path) return null;
+    // The site is served from nested routes (/post/, /blog/), so a bare
+    // "images/..." would resolve against the current route and 404.
+    return /^(\.{0,2}\/|[a-z][a-z0-9+.-]*:|#)/i.test(path) ? path : `/${path}`;
   }
 
   const VIDEO_EXT = /\.(mp4|webm|mov|m4v|ogv)$/i;
@@ -7044,7 +7047,7 @@
               <div class="form-row">
                 <label class="blog-builder-field">
                   <span class="blog-builder-field-label">Thumbnail path</span>
-                  <input class="input" type="text" data-builder-thumbnail placeholder="images/blog/my-post/thumbnail.png" />
+                  <input class="input" type="text" data-builder-thumbnail placeholder="/images/blog/my-post/thumbnail.png" />
                 </label>
                 <label class="blog-builder-field">
                   <span class="blog-builder-field-label">Tags</span>
