@@ -3136,6 +3136,95 @@
     return wrap;
   }
 
+  // Discord-style inline formatting. With opts.marks the delimiters stay in the
+  // output (dimmed) so textContent equals the source text; the builder canvas
+  // relies on that to read edits back and keep the caret.
+  const BLOG_INLINE_RULES = [
+    { re: /`([^`\n]+)`/, tag: "code", cls: "fmt-code", mark: "`", plain: true },
+    { re: /\|\|([\s\S]+?)\|\|/, tag: "span", cls: "fmt-spoiler", mark: "||", spoiler: true },
+    { re: /\*\*\*(?!\s)([\s\S]+?)(?<!\s)\*\*\*/, tag: "strong", inner: "em", mark: "***" },
+    { re: /\*\*(?!\s)([\s\S]+?)(?<!\s)\*\*/, tag: "strong", mark: "**" },
+    { re: /__(?!\s)([\s\S]+?)(?<!\s)__/, tag: "u", mark: "__" },
+    { re: /~~(?!\s)([\s\S]+?)(?<!\s)~~/, tag: "s", mark: "~~" },
+    { re: /\*(?![\s*])([^*\n]+?)(?<![\s*])\*/, tag: "em", mark: "*" },
+    { re: /(?<!\w)_(?![\s_])([^_\n]+?)(?<![\s_])_(?!\w)/, tag: "em", mark: "_" },
+    { re: /\[(\d+)\]/, citation: true }
+  ];
+
+  function appendBlogFormattedText(parent, text, opts = {}) {
+    let rest = String(text ?? "");
+
+    while (rest) {
+      let best = null;
+      BLOG_INLINE_RULES.forEach((rule) => {
+        const match = rule.re.exec(rest);
+        if (match && (!best || match.index < best.match.index)) best = { rule, match };
+      });
+
+      if (!best) {
+        parent.appendChild(document.createTextNode(rest));
+        break;
+      }
+
+      const { rule, match } = best;
+      if (match.index) parent.appendChild(document.createTextNode(rest.slice(0, match.index)));
+
+      if (rule.citation) {
+        const ref = document.createElement(opts.marks ? "span" : "a");
+        ref.className = "post-citation-ref";
+        if (!opts.marks) ref.href = `#citation-${match[1]}`;
+        ref.textContent = match[0];
+        parent.appendChild(ref);
+      } else {
+        const el = document.createElement(rule.tag);
+        if (rule.cls) el.className = rule.cls;
+
+        const addMark = (container) => {
+          if (!opts.marks) return;
+          const mark = document.createElement("span");
+          mark.className = "fmt-mark";
+          mark.textContent = rule.mark;
+          container.appendChild(mark);
+        };
+
+        addMark(el);
+        let inner = el;
+        if (rule.inner) {
+          inner = document.createElement(rule.inner);
+          el.appendChild(inner);
+        }
+        if (rule.plain) inner.appendChild(document.createTextNode(match[1]));
+        else appendBlogFormattedText(inner, match[1], opts);
+        addMark(el);
+
+        if (rule.spoiler) {
+          if (opts.marks) {
+            el.classList.add("is-revealed");
+          } else {
+            el.tabIndex = 0;
+            el.setAttribute("role", "button");
+            el.setAttribute("aria-label", "Spoiler, activate to reveal");
+            const reveal = () => {
+              el.classList.add("is-revealed");
+              el.removeAttribute("role");
+              el.removeAttribute("aria-label");
+            };
+            el.addEventListener("click", reveal);
+            el.addEventListener("keydown", (event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                reveal();
+              }
+            });
+          }
+        }
+        parent.appendChild(el);
+      }
+
+      rest = rest.slice(match.index + match[0].length);
+    }
+  }
+
   function createBlogTextCard(card) {
     const prose = document.createElement("div");
     prose.className = "prose post-card-prose";
@@ -3143,7 +3232,7 @@
     (card.figures || []).forEach((figure) => {
       if (figure.type === "paragraph") {
         const p = document.createElement("p");
-        p.textContent = figure.text;
+        appendBlogFormattedText(p, figure.text);
         prose.appendChild(p);
       }
 
@@ -3151,7 +3240,7 @@
         const list = document.createElement("ul");
         figure.items.forEach((item) => {
           const li = document.createElement("li");
-          li.textContent = item;
+          appendBlogFormattedText(li, item);
           list.appendChild(li);
         });
         prose.appendChild(list);
@@ -4203,8 +4292,8 @@
     heading.textContent = "Citations";
     section.appendChild(heading);
 
-    const list = document.createElement("ul");
-    list.className = "list";
+    const list = document.createElement("ol");
+    list.className = "list post-citations-list";
 
     citations.forEach((citation) => {
       let url = "";
@@ -4221,6 +4310,7 @@
       if (!url) return;
 
       const item = document.createElement("li");
+      item.id = `citation-${list.childNodes.length + 1}`;
       const link = document.createElement("a");
       link.href = url;
       link.target = "_blank";
@@ -6139,6 +6229,57 @@
     selection.addRange(range);
   }
 
+  // Rebuilds an editable with its Discord-style markup, delimiters kept visible.
+  function bbRefreshFormatting(el, value) {
+    if (!String(value ?? "").trim()) return;
+    el.textContent = "";
+    appendBlogFormattedText(el, value, { marks: true });
+  }
+
+  function bbSelectionOffsets(el) {
+    const selection = window.getSelection();
+    if (!selection || !selection.rangeCount) return null;
+
+    const range = selection.getRangeAt(0);
+    if (!el.contains(range.startContainer) || !el.contains(range.endContainer)) return null;
+
+    const probe = document.createRange();
+    probe.selectNodeContents(el);
+    probe.setEnd(range.startContainer, range.startOffset);
+    const start = probe.toString().length;
+    probe.setEnd(range.endContainer, range.endOffset);
+    return { start, end: probe.toString().length };
+  }
+
+  function bbSetSelection(el, start, end) {
+    el.focus();
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    const points = [start, end];
+    const found = [];
+    let consumed = 0;
+
+    while (walker.nextNode() && found.length < 2) {
+      const length = walker.currentNode.textContent.length;
+      while (found.length < 2 && points[found.length] - consumed <= length) {
+        found.push({ node: walker.currentNode, offset: points[found.length] - consumed });
+      }
+      consumed += length;
+    }
+
+    const range = document.createRange();
+    if (found.length === 2) {
+      range.setStart(found[0].node, found[0].offset);
+      range.setEnd(found[1].node, found[1].offset);
+    } else {
+      range.selectNodeContents(el);
+      range.collapse(false);
+    }
+
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }
+
   function bbMakeEditable(el, path, card, opts = {}) {
     if (!el) return null;
 
@@ -6212,15 +6353,20 @@
 
         if (figure.type === "list") {
           Array.from(node.children).forEach((li, r) => {
-            bbMakeEditable(li, `f.${n}.items.${r}`, card, {
+            const itemPath = `f.${n}.items.${r}`;
+            bbMakeEditable(li, itemPath, card, {
               singleLine: true,
               placeholder: "List item"
             });
+            li.setAttribute("data-bb-format", "1");
+            bbRefreshFormatting(li, bbGetPath(card, itemPath));
           });
           return;
         }
 
         bbMakeEditable(node, `f.${n}.text`, card, { placeholder: BB_PLACEHOLDER_PARAGRAPH });
+        node.setAttribute("data-bb-format", "1");
+        bbRefreshFormatting(node, bbGetPath(card, `f.${n}.text`));
       });
     },
 
@@ -6827,7 +6973,10 @@
               Click any text to edit it in place. Hover between blocks for
               <strong>+</strong> to insert one, drag <strong>⠿</strong> to reorder, and use
               <strong>⋯</strong> for fields that aren't plain text (image paths, chart data,
-              link URLs).
+              link URLs). Paragraphs and lists accept Discord-style formatting:
+              <code>**bold**</code> <code>*italic*</code> <code>__underline__</code>
+              <code>~~strike~~</code> <code>\`code\`</code> <code>||spoiler||</code>, with
+              Ctrl/Cmd+B, I, U, E, Shift+X and Shift+P as shortcuts.
             </p>
           </div>
           <div data-builder-preview></div>
@@ -8073,6 +8222,7 @@
       // Commit raw, untrimmed text — cleanText trims, and trimming mid-keystroke
       // would eat spaces as the user types. Trimming happens at serialize time.
       bbSetPath(target.card, target.path, target.el.textContent);
+      restyleCanvasText(target.el);
       scheduleExport();
     });
 
@@ -8080,8 +8230,55 @@
       const target = findCanvasTarget(event.target);
       if (!target) return;
       bbSetPath(target.card, target.path, target.el.textContent);
+      restyleCanvasText(target.el);
       scheduleExport();
     });
+
+    // Re-applies Discord-style markup after an edit, keeping the caret in place.
+    function restyleCanvasText(el) {
+      if (!el.hasAttribute("data-bb-format")) return;
+      const text = el.textContent;
+      if (!el.children.length && !/[*_~`|\[]/.test(text)) return;
+
+      const offset = bbCaretOffset(el);
+      bbRefreshFormatting(el, text);
+      if (offset != null) bbSetCaret(el, offset);
+    }
+
+    const BB_FORMAT_SHORTCUTS = { b: "**", i: "*", u: "__", e: "`" };
+
+    // Wraps the selection in a marker, or strips it when already wrapped.
+    function toggleCanvasWrap(target, marker) {
+      const { el, card, path } = target;
+      const wasEmpty = el.hasAttribute("data-bb-empty");
+      const full = wasEmpty ? "" : el.textContent;
+      const selection = wasEmpty ? { start: 0, end: 0 } : bbSelectionOffsets(el);
+      if (!selection) return;
+
+      const { start, end } = selection;
+      const m = marker.length;
+      let next;
+      let from;
+      let to;
+
+      if (full.slice(start - m, start) === marker && full.slice(end, end + m) === marker) {
+        next = full.slice(0, start - m) + full.slice(start, end) + full.slice(end + m);
+        from = start - m;
+        to = end - m;
+      } else {
+        next = full.slice(0, start) + marker + full.slice(start, end) + marker + full.slice(end);
+        from = start + m;
+        to = end + m;
+      }
+
+      el.classList.remove("bb-placeholder");
+      el.removeAttribute("data-bb-empty");
+      bbSetPath(card, path, next);
+      el.textContent = next;
+      bbRefreshFormatting(el, next);
+      bbSetSelection(el, from, to);
+      scheduleExport();
+    }
 
     // Plain text only: the schema stores strings and every renderer uses textContent.
     refs.preview.addEventListener("paste", (event) => {
@@ -8251,6 +8448,18 @@
       if (event.isComposing) return;
       const target = findCanvasTarget(event.target);
       if (!target) return;
+
+      if (target.el.hasAttribute("data-bb-format") && (event.ctrlKey || event.metaKey) && !event.altKey) {
+        const key = event.key.toLowerCase();
+        const marker = event.shiftKey
+          ? key === "x" ? "~~" : key === "p" ? "||" : ""
+          : BB_FORMAT_SHORTCUTS[key];
+        if (marker) {
+          event.preventDefault();
+          toggleCanvasWrap(target, marker);
+          return;
+        }
+      }
 
       if (event.key === "Enter") handleCanvasEnter(event, target);
       else if (event.key === "Backspace") handleCanvasBackspace(event, target);
